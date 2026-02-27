@@ -1,0 +1,15 @@
+.gradle/
+**/build/
+.idea/
+*.iml
+*.log
+.kaero/
+.DS_Store
+node_modules/
+frontend/dist/
+bun.lockb
+.bun/
+.vscode/
+
+# Generated duplicate sources (should not be committed)
+**/bin/

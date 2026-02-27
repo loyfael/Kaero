@@ -1,0 +1,505 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# -------------------- Pretty output (CLI-like) --------------------
+if [[ -t 1 ]]; then
+  C_RESET="\033[0m"
+  C_DIM="\033[2m"
+  C_RED="\033[31m"
+  C_GREEN="\033[32m"
+  C_YELLOW="\033[33m"
+  C_BLUE="\033[34m"
+else
+  C_RESET=""
+  C_DIM=""
+  C_RED=""
+  C_GREEN=""
+  C_YELLOW=""
+  C_BLUE=""
+fi
+
+log_step() { echo -e "${C_BLUE}▶${C_RESET} $*"; }
+log_ok() { echo -e "${C_GREEN}✅${C_RESET} $*"; }
+log_warn() { echo -e "${C_YELLOW}⚠️${C_RESET} $*"; }
+log_err() { echo -e "${C_RED}❌${C_RESET} $*" >&2; }
+log_hint() { echo -e "${C_DIM}   $*${C_RESET}"; }
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    log_err "Missing command: $1"
+    exit 1
+  }
+}
+
+BACKEND_PORT="${BACKEND_PORT:-8080}"
+FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+BACKEND_URL="http://localhost:${BACKEND_PORT}"
+FRONTEND_URL="http://localhost:${FRONTEND_PORT}"
+
+KAERO_DIR="${KAERO_DIR:-$ROOT_DIR/.kaero}"
+LOG_DIR="$KAERO_DIR/logs"
+BACKEND_LOG="$LOG_DIR/backend.log"
+FRONTEND_LOG="$LOG_DIR/frontend.log"
+
+DEBUG=0
+KILL_PORTS=0
+APP="${KAERO_APP:-sample-app}"
+
+DID_START=0
+
+usage() {
+  cat <<EOF
+Kaero CLI (dev helper)
+
+Usage:
+  ./kaero dev [--app <name>] [--debug] [--kill-ports]
+  ./kaero backend [--app <name>] [--debug] [--kill-ports]
+  ./kaero frontend [--app <name>] [--debug] [--kill-ports]
+  ./kaero build [--app <name>]
+  ./kaero test [--app <name>]
+  ./kaero new <name>
+  ./kaero gen routes [--app <name>]
+  ./kaero logs backend|frontend
+
+Options:
+  --app <name>   Gradle module name (default: sample-app)
+  --debug        Show verbose logs (backend/Gradle).
+  --kill-ports   Try to free ports automatically (uses fuser).
+
+Env:
+  BACKEND_PORT, FRONTEND_PORT
+EOF
+}
+
+port_in_use() {
+  local port="$1"
+
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | grep -qE "[:\[]${port}\\]?\s"
+    return $?
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
+  fi
+
+  return 1
+}
+
+kill_port_if_possible() {
+  local port="$1"
+
+  if [[ "$KILL_PORTS" != "1" ]]; then
+    return 1
+  fi
+
+  if command -v fuser >/dev/null 2>&1; then
+    log_warn "Port ${port} is in use → trying to free it (--kill-ports)"
+    fuser -k "${port}/tcp" >/dev/null 2>&1 || true
+    sleep 0.2
+    return 0
+  fi
+
+  log_warn "fuser not found → cannot auto-free ports"
+  return 1
+}
+
+cleanup() {
+  if [[ "$DID_START" != "1" ]]; then
+    return 0
+  fi
+
+  echo
+  log_step "Stopping dev servers..."
+
+  if [[ -n "${BACK_PID:-}" ]]; then
+    kill "$BACK_PID" 2>/dev/null || true
+    if command -v pkill >/dev/null 2>&1; then
+      pkill -TERM -P "$BACK_PID" 2>/dev/null || true
+    fi
+  fi
+}
+trap cleanup INT TERM EXIT
+
+ensure_log_dir() {
+  mkdir -p "$LOG_DIR"
+}
+
+app_path() {
+  echo "$ROOT_DIR/$APP"
+}
+
+frontend_path() {
+  echo "$(app_path)/frontend"
+}
+
+gradle_task() {
+  local task="$1"
+  echo ":${APP}:${task}"
+}
+
+start_backend() {
+  need gradle
+  ensure_log_dir
+
+  DID_START=1
+
+  if port_in_use "$BACKEND_PORT"; then
+    if ! kill_port_if_possible "$BACKEND_PORT"; then
+      log_err "Backend port ${BACKEND_PORT} is already in use."
+      log_hint "Stop the existing process, or rerun with: ./kaero dev --kill-ports"
+      exit 1
+    fi
+  fi
+
+  log_step "Starting backend (Ktor) on ${BACKEND_URL} ..."
+
+  if [[ "$DEBUG" == "1" ]]; then
+    (
+      cd "$ROOT_DIR"
+      exec gradle "$(gradle_task run)" 2>&1 | tee "$BACKEND_LOG"
+    ) &
+  else
+    log_hint "Backend logs → ${BACKEND_LOG}"
+    (
+      cd "$ROOT_DIR"
+      exec gradle "$(gradle_task run)" >"$BACKEND_LOG" 2>&1
+    ) &
+  fi
+
+  BACK_PID=$!
+}
+
+wait_backend_ready() {
+  if ! command -v curl >/dev/null 2>&1; then
+    log_warn "curl not found → skipping backend readiness check"
+    return 0
+  fi
+
+  log_step "Waiting for backend to be ready..."
+  for i in {1..150}; do
+    if ! kill -0 "$BACK_PID" 2>/dev/null; then
+      log_err "Backend process exited while starting."
+      if [[ -f "$BACKEND_LOG" ]]; then
+        log_hint "Last backend logs:"
+        tail -n 40 "$BACKEND_LOG" 2>/dev/null || true
+      fi
+      exit 1
+    fi
+
+    if curl -sf "${BACKEND_URL}/api/todos" >/dev/null 2>&1; then
+      log_ok "Backend is ready."
+      return 0
+    fi
+
+    if (( i % 15 == 0 )); then
+      echo -ne "${C_DIM}   still starting...${C_RESET}\r"
+    fi
+    sleep 0.2
+  done
+
+  echo ""
+  log_warn "Backend did not respond in time."
+  log_hint "Try: ./kaero dev --debug"
+}
+
+start_frontend() {
+  need bun
+  ensure_log_dir
+
+  DID_START=1
+
+  if port_in_use "$FRONTEND_PORT"; then
+    if ! kill_port_if_possible "$FRONTEND_PORT"; then
+      log_err "Frontend port ${FRONTEND_PORT} is already in use."
+      log_hint "Stop the existing process, or rerun with: ./kaero dev --kill-ports"
+      exit 1
+    fi
+  fi
+
+  log_step "Starting frontend (Vite) on ${FRONTEND_URL} ..."
+  cd "$(frontend_path)"
+
+  if [[ "$DEBUG" == "1" ]]; then
+    exec bun run dev 2>&1 | tee "$FRONTEND_LOG"
+  else
+    # Keep Vite output visible, but also persist it.
+    exec bun run dev 2>&1 | tee "$FRONTEND_LOG"
+  fi
+}
+
+run_build() {
+  need gradle
+  need bun
+  ensure_log_dir
+
+  local backend_build_log="$LOG_DIR/backend-build.log"
+  local frontend_build_log="$LOG_DIR/frontend-build.log"
+
+  log_step "Building backend..."
+  if [[ "$DEBUG" == "1" ]]; then
+    (cd "$ROOT_DIR" && gradle "$(gradle_task build)" 2>&1 | tee "$backend_build_log")
+  else
+    (cd "$ROOT_DIR" && gradle "$(gradle_task build)" >"$backend_build_log" 2>&1)
+    log_hint "Backend build logs: $backend_build_log"
+  fi
+  log_ok "Backend build OK"
+
+  log_step "Building frontend..."
+  if [[ "$DEBUG" == "1" ]]; then
+    (cd "$(frontend_path)" && bun run build 2>&1 | tee "$frontend_build_log")
+  else
+    (cd "$(frontend_path)" && bun run build >"$frontend_build_log" 2>&1)
+    log_hint "Frontend build logs: $frontend_build_log"
+  fi
+  log_ok "Frontend build OK"
+}
+
+run_test() {
+  need gradle
+  need bun
+  ensure_log_dir
+
+  local backend_test_log="$LOG_DIR/backend-test.log"
+  local frontend_test_log="$LOG_DIR/frontend-test.log"
+
+  log_step "Running backend tests..."
+  if [[ "$DEBUG" == "1" ]]; then
+    (cd "$ROOT_DIR" && gradle "$(gradle_task test)" 2>&1 | tee "$backend_test_log")
+  else
+    (cd "$ROOT_DIR" && gradle "$(gradle_task test)" >"$backend_test_log" 2>&1)
+    log_hint "Backend test logs: $backend_test_log"
+  fi
+  log_ok "Backend tests OK"
+
+  log_step "Running frontend typecheck..."
+  if [[ "$DEBUG" == "1" ]]; then
+    (cd "$(frontend_path)" && bunx vue-tsc --noEmit 2>&1 | tee "$frontend_test_log")
+  else
+    (cd "$(frontend_path)" && bunx vue-tsc --noEmit >"$frontend_test_log" 2>&1)
+    log_hint "Frontend typecheck logs: $frontend_test_log"
+  fi
+  log_ok "Frontend typecheck OK"
+}
+
+cmd_new() {
+  local name="$1"
+
+  if [[ -z "$name" ]]; then
+    log_err "Missing app name."
+    usage
+    exit 1
+  fi
+
+  if [[ ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    log_err "Invalid app name: $name"
+    log_hint "Allowed: letters, numbers, underscore, dash"
+    exit 1
+  fi
+
+  local target="$ROOT_DIR/$name"
+  if [[ -e "$target" ]]; then
+    log_err "Target already exists: $target"
+    exit 1
+  fi
+
+  if [[ ! -d "$ROOT_DIR/sample-app" ]]; then
+    log_err "Template not found: $ROOT_DIR/sample-app"
+    exit 1
+  fi
+
+  log_step "Creating app module '$name' from template..."
+  cp -R "$ROOT_DIR/sample-app" "$target"
+  rm -rf "$target/frontend/node_modules" "$target/frontend/dist" 2>/dev/null || true
+  rm -rf "$target/build" 2>/dev/null || true
+
+  if [[ -f "$target/README.md" ]]; then
+    sed -i "s/Kaero sample-app/Kaero ${name}/g" "$target/README.md" 2>/dev/null || true
+  fi
+
+  local settings="$ROOT_DIR/settings.gradle.kts"
+  if [[ -f "$settings" ]]; then
+    if ! grep -q "include(\":${name}\")" "$settings"; then
+      log_step "Registering module in settings.gradle.kts"
+      printf '\ninclude(":%s")\n' "$name" >> "$settings"
+    else
+      log_warn "settings.gradle.kts already includes :${name}"
+    fi
+  else
+    log_warn "No settings.gradle.kts found; cannot auto-register module"
+  fi
+
+  log_ok "Created ${name}"
+  log_hint "Run: ./kaero dev --app ${name}"
+}
+
+cmd_gen_routes() {
+  local base
+  base="$(app_path)/src/main/kotlin"
+
+  if [[ ! -d "$base" ]]; then
+    log_err "Cannot find Kotlin sources at: $base"
+    exit 1
+  fi
+
+  local out_dir="$KAERO_DIR/generated"
+  local out_file="$out_dir/routes-${APP}.json"
+  mkdir -p "$out_dir"
+
+  log_step "Generating routes from annotations (best-effort)..."
+  log_hint "Scanning: $base"
+
+  local tmp
+  tmp="$(mktemp)"
+
+  grep -RohE '@(Get|Post|Put|Patch|Delete)\("[^"]+"\)' "$base" \
+    | sed -E 's/^@([A-Za-z]+)\("([^"]+)"\)$/\1 \2/' \
+    | awk '
+        BEGIN { first = 1 }
+        {
+          if (first) { print "["; first = 0 } else { print "," }
+          printf "  {\"method\": \"%s\", \"path\": \"%s\"}", toupper($1), $2
+        }
+        END {
+          if (first) { print "[]" } else { print "\n]" }
+        }
+      ' \
+    >"$tmp" || true
+  mv "$tmp" "$out_file"
+
+  log_ok "Routes generated"
+  log_hint "$out_file"
+}
+
+show_logs() {
+  ensure_log_dir
+  local which="$1"
+  case "$which" in
+    backend)
+      if [[ ! -f "$BACKEND_LOG" ]]; then
+        log_err "No backend log file found at ${BACKEND_LOG}"
+        exit 1
+      fi
+      tail -n 200 "$BACKEND_LOG"
+      ;;
+    frontend)
+      if [[ ! -f "$FRONTEND_LOG" ]]; then
+        log_err "No frontend log file found at ${FRONTEND_LOG}"
+        exit 1
+      fi
+      tail -n 200 "$FRONTEND_LOG"
+      ;;
+    *)
+      log_err "Unknown logs target: $which"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --app)
+      shift
+      APP="${1:-}"
+      if [[ -z "$APP" ]]; then
+        log_err "--app requires a value"
+        exit 1
+      fi
+      ;;
+    --debug)
+      DEBUG=1
+      ;;
+    --kill-ports)
+      KILL_PORTS=1
+      ;;
+    -h|--help)
+      POSITIONAL=("help")
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        POSITIONAL+=("$1")
+        shift
+      done
+      break
+      ;;
+    *)
+      POSITIONAL+=("$1")
+      ;;
+  esac
+  shift
+done
+
+cmd="${POSITIONAL[0]:-help}"
+
+if [[ ${#POSITIONAL[@]} -gt 1 ]]; then
+  set -- "${POSITIONAL[@]:1}"
+else
+  set --
+fi
+
+case "$cmd" in
+  help|-h|--help)
+    usage
+    ;;
+  dev)
+    log_step "Kaero dev"
+    log_hint "Backend:  ${BACKEND_URL}"
+    log_hint "Frontend: ${FRONTEND_URL}"
+    if [[ "$DEBUG" == "1" ]]; then
+      log_warn "Debug enabled: backend logs will be very verbose."
+    fi
+    start_backend
+    wait_backend_ready
+    start_frontend
+    ;;
+  backend)
+    log_step "Kaero backend"
+    log_hint "Backend: ${BACKEND_URL}"
+    start_backend
+    wait_backend_ready
+    log_ok "Backend running. (Ctrl+C to stop)"
+    wait "$BACK_PID"
+    ;;
+  frontend)
+    log_step "Kaero frontend"
+    log_hint "Frontend: ${FRONTEND_URL}"
+    start_frontend
+    ;;
+  build)
+    run_build
+    ;;
+  test)
+    run_test
+    ;;
+  new)
+    cmd_new "${1:-}"
+    ;;
+  gen)
+    sub="${1:-}"
+    shift || true
+    case "$sub" in
+      routes)
+        cmd_gen_routes
+        ;;
+      *)
+        log_err "Unknown gen command: $sub"
+        log_hint "Try: ./kaero gen routes"
+        exit 1
+        ;;
+    esac
+    ;;
+  logs)
+    show_logs "${1:-}"
+    ;;
+  *)
+    log_err "Unknown command: $cmd"
+    usage
+    exit 1
+    ;;
+esac
