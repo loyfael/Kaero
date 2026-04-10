@@ -13,3 +13,4 @@ bun.lockb
 
 # Generated duplicate sources (should not be committed)
 **/bin/
+/trash
