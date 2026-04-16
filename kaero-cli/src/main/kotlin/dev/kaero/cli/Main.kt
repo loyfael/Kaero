@@ -319,27 +319,130 @@ private fun templateReadme(appName: String): String =
     """
 +# $appName (Kaero)
 +
++Kaero generated this project as a small full-stack starter: a Kotlin backend, a Vue frontend, and a local runtime module under `.kaero/`.
++
 +## Requirements
 +
 +- Java 25
 +- Gradle >= $MIN_GRADLE
 +- Bun >= $MIN_BUN
 +
-+## Run (dev)
++Check your tools:
 +
-+Backend:
++```bash
++java -version
++gradle --version
++bun --version
++```
++
++## Quick start
++
++From the project root, install frontend dependencies:
++
++```bash
++bun install --cwd $appName/frontend
++```
++
++Start the backend:
 +
 +```bash
 +./gradlew :$appName:run
 +```
 +
-+Frontend:
++On Windows PowerShell, use:
++
++```powershell
++.\gradlew.bat :$appName:run
++```
++
++Backend URL:
++
++```text
++http://localhost:8080
++```
++
++In another terminal, start the frontend:
 +
 +```bash
 +cd $appName/frontend
-+bun install
 +bun run dev
 +```
++
++Frontend URL:
++
++```text
++http://localhost:5173
++```
++
++In development, Vite proxies `/api` to `http://localhost:8080`.
++
++## Project structure
++
++```text
++.
++├── .kaero/                  # generated runtime module used by the app
++├── $appName/                # application module
++│   ├── frontend/            # Vue 3 + Vite + TypeScript frontend
++│   └── src/main/kotlin/     # Kotlin backend source
++├── gradle/
++├── gradlew
++├── gradlew.bat
++├── build.gradle.kts
++├── settings.gradle.kts
++└── README.md
++```
++
++Important backend files:
++
++- `$appName/src/main/kotlin/dev/kaero/app/Main.kt`: server entrypoint
++- `$appName/src/main/kotlin/dev/kaero/app/kaero/Routes.kt`: central route registration
++- `$appName/src/main/kotlin/dev/kaero/app/app/controllers/`: HTTP controllers
++- `$appName/src/main/kotlin/dev/kaero/app/app/services/`: application logic
++
++Important frontend files:
++
++- `$appName/frontend/src/app/core/routing/router.ts`: hash-based routing
++- `$appName/frontend/src/app/app.view.vue`: active page selection
++- `$appName/frontend/src/app/features/counter/`: starter feature example
++
++## Starter app conventions
++
++The generated backend uses one central routing entrypoint. Controllers are registered in `Routes.kt` and expose endpoints with annotations such as `@Get`, `@Post`, `@Patch`, and `@Delete`.
++
++The generated frontend keeps a simple Angular-style structure:
++
++- `core/` for infrastructure
++- `features/<feature>/` for pages, stores, and services
++- a small Pinia-based router instead of `vue-router`
++
++The starter includes:
++
++- a `counter` page in the frontend
++- a `TodosController` backend example under `/api/todos`
++
++## Production build
++
++Build the frontend:
++
++```bash
++bun --cwd $appName/frontend run build
++```
++
++Then start the backend again:
++
++```bash
++./gradlew :$appName:run
++```
++
++If `$appName/frontend/dist` exists, the backend serves the built frontend and falls back to `index.html` for SPA routes.
++
++## Next steps
++
++Good first changes:
++
++- rename or replace the `counter` feature
++- add your own controller and register it in `Routes.kt`
++- connect the frontend to your backend endpoints under `/api`
 +""".trimIndent()
 
 private fun templateGitignore(): String =
