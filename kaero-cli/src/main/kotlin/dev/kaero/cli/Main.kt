@@ -11,6 +11,7 @@ import kotlin.io.path.name
 private const val MIN_BUN = "1.2.0"
 private const val MIN_GRADLE = "9.3.0"
 private const val REQUIRED_JAVA_MAJOR = 25
+private val IS_WINDOWS = System.getProperty("os.name").startsWith("Windows", ignoreCase = true)
 
 fun main(args: Array<String>) {
     val argv = args.toList()
@@ -116,7 +117,7 @@ private fun cmdInit(args: List<String>) {
     writeText(targetDir.resolve("settings.gradle.kts"), templateSettings(appName))
     writeText(targetDir.resolve("build.gradle.kts"), templateRootBuild())
 
-    writeRuntimeModule(targetDir.resolve("kaero-runtime"))
+    writeRuntimeModule(targetDir.resolve(".kaero"))
     writeAppModule(targetDir.resolve(appName), appName)
 
     // Generate a real Gradle Wrapper (cross-platform scripts + wrapper JAR).
@@ -124,8 +125,7 @@ private fun cmdInit(args: List<String>) {
     println("▶ Generating Gradle Wrapper...")
     val wrapperOk = runInDir(
         dir = targetDir,
-        command = listOf(
-            "gradle",
+        command = gradleCommand(
             "wrapper",
             "--gradle-version",
             "9.3.1",
@@ -170,7 +170,7 @@ private fun checkBun(): CheckResult {
 
 private fun checkJava(): CheckResult {
     // `java -version` prints to stderr on most JDKs.
-    val out = runAndCapture(listOf("java", "-version"), mergeStderr = true)
+    val out = runAndCapture(javaCommand("-version"), mergeStderr = true)
     if (out == null) {
         val msg = "Java not found in PATH"
         System.err.println("❌ Java: $msg")
@@ -196,7 +196,7 @@ private fun checkJava(): CheckResult {
 }
 
 private fun checkGradle(): CheckResult {
-    val out = runAndCapture(listOf("gradle", "--version"))
+    val out = runAndCapture(gradleCommand("--version"))
     if (out == null) {
         val msg = "Gradle not found in PATH"
         System.err.println("❌ Gradle: $msg")
@@ -223,7 +223,7 @@ private fun checkGradle(): CheckResult {
 
 private fun runAndCapture(command: List<String>, mergeStderr: Boolean = false): String? {
     return try {
-        val pb = ProcessBuilder(command)
+        val pb = processBuilder(command)
         if (mergeStderr) pb.redirectErrorStream(true)
         val process = pb.start()
         val bytes = process.inputStream.readBytes()
@@ -259,14 +259,60 @@ private fun writeText(path: Path, content: String) {
 
 private fun runInDir(dir: Path, command: List<String>): Boolean {
     return try {
-        val pb = ProcessBuilder(command)
-            .directory(dir.toFile())
-            .inheritIO()
+        val pb = processBuilder(command)
+        pb.directory(dir.toFile())
+        pb.inheritIO()
         val process = pb.start()
         process.waitFor() == 0
     } catch (_: Throwable) {
         false
     }
+}
+
+private fun processBuilder(command: List<String>): ProcessBuilder {
+    if (!IS_WINDOWS || !needsWindowsShell(command.firstOrNull().orEmpty())) {
+        return ProcessBuilder(command)
+    }
+
+    return ProcessBuilder("cmd", "/c", windowsCommandLine(command))
+}
+
+private fun needsWindowsShell(executable: String): Boolean {
+    val normalized = executable.lowercase()
+    if (normalized.endsWith(".bat") || normalized.endsWith(".cmd")) {
+        return true
+    }
+
+    return Path.of(executable).fileName.toString() == executable && '.' !in executable
+}
+
+private fun windowsCommandLine(command: List<String>): String =
+    command.joinToString(" ") { quoteWindowsArg(it) }
+
+private fun quoteWindowsArg(value: String): String {
+    if (value.isEmpty()) return "\"\""
+    if (value.none { it.isWhitespace() || it == '"' }) return value
+    return '"' + value.replace("\"", "\\\"") + '"'
+}
+
+private fun javaCommand(vararg args: String): List<String> =
+    listOf(resolveExecutable("JAVA_HOME", "java", listOf("bin/java.exe", "bin/java"))) + args
+
+private fun gradleCommand(vararg args: String): List<String> =
+    listOf(resolveExecutable("GRADLE_HOME", "gradle", listOf("bin/gradle.bat", "bin/gradle"))) + args
+
+private fun resolveExecutable(homeVar: String, fallback: String, candidates: List<String>): String {
+    val home = System.getenv(homeVar)?.takeIf { it.isNotBlank() } ?: return fallback
+    val homePath = Path.of(home)
+
+    for (candidate in candidates) {
+        val executable = homePath.resolve(candidate).normalize()
+        if (Files.isRegularFile(executable)) {
+            return executable.toString()
+        }
+    }
+
+    return fallback
 }
 
 private fun templateReadme(appName: String): String =
@@ -349,8 +395,9 @@ private fun templateSettings(appName: String): String =
 +    }
 +}
 +
-+rootProject.name = "${appName}-kaero"
-+include(":kaero-runtime")
+rootProject.name = "${appName}-kaero"
+include(":kaero")
+project(":kaero").projectDir = file(".kaero")
 +include(":$appName")
 +""".trimIndent().trimStart('+').replace("\n+", "\n")
 
@@ -894,7 +941,7 @@ private fun templateAppBuild(appName: String): String =
 +}
 +
 +dependencies {
-+    implementation(project(":kaero-runtime"))
++    implementation(project(":kaero"))
 +
 +    implementation("io.ktor:ktor-server-core-jvm:${'$'}ktorVersion")
 +    implementation("io.ktor:ktor-server-netty-jvm:${'$'}ktorVersion")
